@@ -1,0 +1,43 @@
+# reference files
+refs:
+  genome:             /mnt/hsf/GRCh38.primary_assembly.genome.fa
+  cpg_interet:        /mnt/RetD/DNAseq_LR_AS/methylation_KL/data-base/benchmark/sites_island_epic_sorted.bed
+  adaptive_sampling1: /mnt/RetD/DNAseq_LR_AS/methylation_KL/data-base/BED_adaptive_sampling/Hereditary_cancer_gene_HG38_15kb_1er_BED.bed
+  adaptive_sampling2: /mnt/RetD/DNAseq_LR_AS/methylation_KL/data-base/BED_adaptive_sampling/Cancer_gene_and_regulator_element_5_genes_HG38_15kb_2nd_BED.bed
+  adaptive_sampling3: /mnt/RetD/DNAseq_LR_AS/methylation_KL/data-base/BED_adaptive_sampling/Cancer_gene_and_regulator_element_extented_HG38_3rd_BED.bed
+  ccre:               /mnt/RetD/DNAseq_LR_AS/methylation_KL/data-base/encodeCcreCombined.tsv
+  refgene:            /mnt/RetD/DNAseq_LR_AS/methylation_KL/data-base/refGene/refGene.txt
+  risk:               /mnt/RetD/DNAseq_LR_AS/methylation_KL/SnakeMake_workflow/methylation_kl/config/risk.tsv
+  metadata:           /mnt/RetD/DNAseq_LR_AS/methylation_KL/SnakeMake_workflow/methylation_kl/config/metadata.tsv
+
+
+# directories
+dirs:
+  indir_bam:             /mnt/hsf/DNAseq_LR_AS
+  dir_data:              /mnt/RetD/DNAseq_LR_AS/methylation_KL/data-base
+  cache:                 /mnt/RetD/DNAseq_LR_AS/methylation_KL/SnakeMake_workflow/snakemake_cache
+  gimmecpg:              /mnt/RetD/DNAseq_LR_AS/methylation_KL/SnakeMake_workflow/imputation_gimmecpg
+  outdir_before:         /mnt/RetD/DNAseq_LR_AS/methylation_KL/SnakeMake_workflow/snakemake_resultat/imputation_before
+  outdir_before_figures: /mnt/RetD/DNAseq_LR_AS/methylation_KL/SnakeMake_workflow/snakemake_resultat/imputation_before/figures
+  outdir_after:          /mnt/RetD/DNAseq_LR_AS/methylation_KL/SnakeMake_workflow/snakemake_resultat/imputation_after
+  outdir_after_stats:    /mnt/RetD/DNAseq_LR_AS/methylation_KL/SnakeMake_workflow/snakemake_resultat/imputation_after/stats
+  outdir_after_figures:  /mnt/RetD/DNAseq_LR_AS/methylation_KL/SnakeMake_workflow/snakemake_resultat/imputation_after/figures
+
+# Samples
+dataset: /mnt/RetD/DNAseq_LR_AS/methylation_KL/SnakeMake_workflow/methylation_kl/config/dataset_1.tsv
+
+# containerss
+singularity:
+  python-tools: "/mnt/remote_references/containers/python-tools/python-tools.latest"
+  bedtools:     "/mnt/remote_references/containers/bedtools/bedtools.latest"
+  samtools:     "/mnt/remote_references/containers/samtools/samtools.latest"
+  dorado:       "/mnt/RetD/DNAseq_LR_AS/test/test_dorado.sif"
+  modkit:       "/mnt/remote_references/containers/modkit/modkit.latest"
+
+# threads
+threads: 35
+
+# constantes
+min_cov: 1
+
+methode_imputation : "no_impute"
