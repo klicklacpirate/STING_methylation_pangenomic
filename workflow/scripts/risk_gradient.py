@@ -10,45 +10,26 @@ available-case précalculée, avec :
      Adaptée à une variable comme le score de risque de Manchester.
 
   2. PERMANOVA (--permanova-column) : test de différence de position entre
-     groupes CATÉGORIELS directement sur la matrice de distance (Anderson,
-     2001 / McArdle & Anderson, 2001), avec p-value obtenue par permutation
-     des labels de groupe. Adaptée à une variable nominale comme le run de
-     séquençage (effet batch) ou un groupe clinique.
+     groupes CATÉGORIELS directement sur la matrice de distance, avec p-value
+     obtenue par permutation des labels de groupe. Adaptée à une variable
+     nominale comme le run de séquençage (effet batch) ou un groupe clinique.
 
-  IMPORTANT : ce sont deux tests différents pour deux types de variables
-  différents. Ne pas utiliser l'analyse de gradient (1) pour une variable
-  catégorielle non ordonnée (ça imposerait un ordre arbitraire aux
-  catégories) ; ne pas utiliser PERMANOVA (2) pour une variable continue
-  sans la discrétiser au préalable (ce qui ferait perdre de l'information).
-
-  3. Coloration générique des figures (--metadata + --color-by) : reprend
-     la même logique que clustering.py (_color_vector) — colonne numérique
-     -> dégradé continu viridis + colorbar ; colonne non numérique ->
-     palette catégorielle à 25 couleurs (identique à clustering.py, pour
-     rester visuellement cohérent entre les figures du rapport et pour
-     supporter jusqu'à 25 groupes, ex. 25 runs de séquençage).
-     Découplée de --risk-file : on peut colorer par âge, groupe clinique,
-     run, etc. sans que ça affecte l'analyse de gradient.
 
 Entrée :
-  - --distance-matrix : pairwise_distance_matrix.tsv produit par
-    build_pairwise_clustering.py (matrice patients x patients, RMSE
-    available-case)
+  - --distance-matrix : distance_matrix.tsv produit par
+    build_pairwise_clustering.py (matrice patients x patients)
   - --risk-file (optionnel) : TSV à 2 colonnes "patient" et "risk"
     (score continu ou ordinal). Utilisé UNIQUEMENT pour l'analyse de
-    gradient (1). Si omis, seule la PCoA est produite.
+    gradient.
   - --metadata (optionnel) : TSV avec colonne "patient" (ou index) et une
     ou plusieurs colonnes de métadonnées (age, run, clinical_group, ...).
     Utilisé pour --color-by (coloration des figures) et --permanova-column
     (test PERMANOVA).
   - --color-by (optionnel) : nom de colonne dans --metadata utilisé pour
     colorer le nuage de points PCoA. Si omis et --risk-file fourni, colore
-    par le risque (comportement historique conservé pour compatibilité).
+    par le risque.
   - --permanova-column (optionnel) : nom de colonne CATÉGORIELLE dans
     --metadata à tester par PERMANOVA contre la matrice de distance.
-    Peut être appelé plusieurs fois indirectement en relançant le script
-    avec une colonne différente (ex. une fois avec "run" pour l'effet
-    batch, une fois avec "clinical_group" pour l'association clinique).
 
 Sorties (TSV) :
   - pcoa_eigenvalues.tsv       : variance expliquée par axe + diagnostic
@@ -88,9 +69,6 @@ from matplotlib.colors import Normalize
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
 log = logging.getLogger(__name__)
 
-# Palette identique à clustering.py, pour rester visuellement cohérent
-# entre toutes les figures du rapport et supporter jusqu'à 25 catégories
-# (ex. 25 runs de séquençage) sans collision de couleur.
 PALETTE = [
     "#FFA2A2A2", "#FFD230AB", "#35530EAC", "#5EE9B6A6", "#E1712BA9",
     "#8EC5FFA4", "#C4B4FFAC", "#024970A7", "#FFA1ADA9", "#E71A0BA9",
@@ -106,11 +84,9 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("--distance-matrix", required=True,
-                   help="pairwise_distance_matrix.tsv (patients x patients)")
+                   help="distance_matrix.tsv (patients x patients)")
     p.add_argument("--risk-file", default=None,
-                   help="TSV 2 colonnes: patient, risk (score continu ou ordinal). "
-                        "Utilisé uniquement pour l'analyse de gradient LOOCV. "
-                        "Si omis, seule la PCoA est produite (pas de gradient).")
+                   help="TSV 2 colonnes: patient, risk (score continu ou ordinal). ")
     p.add_argument("--metadata", default=None,
                    help="TSV avec colonne 'patient' (ou index) + colonnes de "
                         "métadonnées arbitraires (age, run, clinical_group, ...). "
@@ -129,11 +105,7 @@ def parse_args():
                         "continu.")
     p.add_argument("--lingoes-correction", action="store_true", default=True,
                    help="Corrige les distances si des valeurs propres négatives "
-                        "existent (défaut: activé). Correction de Lingoes : "
-                        "ajoute une constante 2*|lambda_min| aux distances au "
-                        "carré hors-diagonale, rend la matrice de Gram "
-                        "semi-définie positive sans changer l'ordre relatif "
-                        "des distances.")
+                        "existent (défaut: activé).")
     p.add_argument("--no-lingoes-correction", dest="lingoes_correction", action="store_false")
     p.add_argument("--max-axes", type=int, default=None,
                    help="Nombre max d'axes PCoA considérés pour le gradient de "
@@ -148,8 +120,7 @@ def parse_args():
     p.add_argument("--no-plots", dest="make_plots", action="store_false", default=True,
                    help="Désactive la génération des figures PNG (TSV seuls).")
     p.add_argument("--label-bool", action="store_true", default=False,
-                   help="Annote chaque point du nuage d'ordination avec l'ID patient "
-                        "(à éviter si la cohorte est grande, ça devient illisible).")
+                   help="Annote chaque point du nuage d'ordination avec l'ID patient ")
     p.add_argument("--dpi", type=int, default=150)
     return p.parse_args()
 
@@ -175,10 +146,10 @@ def _gower_decomposition(dist: np.ndarray):
 
 def lingoes_correction(dist: np.ndarray) -> np.ndarray:
     """
-    Correction de Lingoes (1971) : ajoute une constante additive aux distances
+    Correction de Lingoes : ajoute une constante additive aux distances
     au carré hors-diagonale pour éliminer les valeurs propres négatives de la
     décomposition de Gower, tout en préservant l'ordre relatif des distances
-    originales (la correction est une transformation monotone).
+    originales.
     """
     eigvals, _ = _gower_decomposition(dist)
     lambda_min = eigvals.min()
@@ -245,11 +216,8 @@ def _ols_fit_predict(X_train, y_train, x_test):
 
 def loocv_q2(X: np.ndarray, y: np.ndarray) -> float:
     """
-    Q2 leave-one-out : la SEULE métrique honnête ici. Le R2 in-sample d'une
-    régression multiple augmente mécaniquement avec le nombre de prédicteurs
-    (axes PCoA) même en l'absence de tout signal réel. Le Q2 LOOCV ré-estime
-    le modèle en excluant chaque patient à tour de rôle et mesure la capacité
-    prédictive hors-échantillon.
+    Q2 leave-one-out : ré-estime le modèle en excluant chaque patient à tour
+    de rôle et mesure la capacité prédictive hors-échantillon.
     """
     n = X.shape[0]
     preds = np.empty(n)
@@ -292,41 +260,12 @@ def benjamini_hochberg(pvals: np.ndarray) -> np.ndarray:
 
 
 # --------------------------------------------------------------------------- #
-# PERMANOVA (Anderson, 2001 / McArdle & Anderson, 2001)
+# PERMANOVA
 # --------------------------------------------------------------------------- #
 def permanova(dist: np.ndarray, groups: np.ndarray, n_permutations: int = 999,
               random_state: int = 42) -> dict:
     """
-    PERMANOVA calculée directement sur la matrice de distance, sans passer
-    par une décomposition en coordonnées (PCoA) — inutile pour ce test.
-
-    Formule (McArdle & Anderson, 2001), équivalente à la décomposition ANOVA
-    classique mais appliquée à des sommes de distances au carré plutôt qu'à
-    des sommes de carrés de résidus autour d'une moyenne euclidienne :
-
-        SS_total   = (1/N) * somme_{i<j} d_ij^2                     (toutes paires)
-        SS_within  = somme_g (1/n_g) * somme_{i<j dans g} d_ij^2    (intra-groupe)
-        SS_between = SS_total - SS_within
-        pseudo_F   = (SS_between / (a-1)) / (SS_within / (N-a))
-
-    avec a = nombre de groupes, N = nombre total de patients, n_g = taille
-    du groupe g. Un groupe réduit à 1 individu ne contribue aucune paire
-    intra-groupe (aucun terme de variance interne calculable), il ne compte
-    donc que dans SS_between.
-
-    La distribution nulle du pseudo-F n'étant pas connue analytiquement pour
-    une distance quelconque, la significativité est évaluée en permutant les
-    labels de groupe n_permutations fois et en comparant le pseudo-F observé
-    à cette distribution empirique.
-
-    LIMITE IMPORTANTE : PERMANOVA teste une différence de POSITION
-    (centroïde) des groupes dans l'espace de dissimilarité, mais reste
-    sensible à une différence de DISPERSION intra-groupe — un groupe plus
-    hétérogène que les autres peut à lui seul produire un pseudo-F
-    significatif même sans vraie séparation des centroïdes. Un résultat
-    significatif devrait idéalement être complété par un test d'homogénéité
-    de dispersion (PERMDISP / betadisper) avant d'être interprété comme une
-    vraie séparation entre groupes.
+    PERMANOVA calculée directement sur la matrice de distance.
     """
     N = dist.shape[0]
     groups = np.asarray(groups)
@@ -429,18 +368,7 @@ def _load_metadata(path, patients: list):
 
 def _color_by_column(meta: pd.DataFrame, patients: list, color_by: str):
     """
-    Reproduit la logique de clustering.py::_color_vector pour rester
-    visuellement cohérent entre toutes les figures du rapport.
-
-    - Colonne numérique (après coercition complète) : dégradé continu
-      (viridis), légende sous forme de colorbar.
-    - Colonne non numérique, ou partiellement numérique : palette
-      catégorielle (jusqu'à 25 groupes avant collision de couleur),
-      légende sous forme de patches discrets.
-
-    Retourne (colors, mode, legend_info, label) où :
-      mode == "continuous"  -> legend_info est une matplotlib.colors.Normalize
-      mode == "categorical" -> legend_info est une liste de mpatches.Patch
+    Coloration par métadonnée (colonne de --metadata) : continue (viridis) ou catégorielle (palette fixe).
     """
     if meta is None or color_by not in meta.columns:
         raise ValueError(f"Colonne '{color_by}' absente des métadonnées fournies.")
@@ -503,10 +431,7 @@ def plot_ordination(coord_df: pd.DataFrame, eig_table: pd.DataFrame, outpath: st
                      label_bool: bool = False, dpi: int = 150):
     """
     Nuage de points des patients dans l'espace PCoA (PCo1 x PCo2, et PCo1 x PCo3
-    si disponible). `colors`/`mode`/`legend_info` sont déjà résolus en amont par
-    _color_by_column (métadonnées) ou par la logique risque historique — cette
-    fonction ne fait plus aucune décision de coloration elle-même, ce qui évite
-    toute divergence entre le nuage de points et sa légende.
+    si disponible).
     """
     def pct(axis_name):
         row = eig_table.loc[eig_table["axis"] == axis_name, "pct_variance"]

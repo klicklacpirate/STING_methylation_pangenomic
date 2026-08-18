@@ -12,15 +12,12 @@ Sous-commandes :
   1. prepare
         methylation_cohort.tsv → clustering_matrix.parquet (défaut) ou .tsv
         - Filtre sur mod_code (m ou h)
-        - Filtre de complétude par site (réduit la dépendance à
-          l'imputation, distinct du filtre semi-strict amont)
+        - Filtre de complétude par site (réduit la dépendance à l'imputation)
         - Imputation des NaN résiduels par médiane / kNN / PCA itérative
         - Sélection optionnelle des top N sites les plus variables
-          (variance inter-patients, calculée après imputation —
-          déconseillée pour les cohortes modérées, cf. --top-n)
+          (variance inter-patients, calculée après imputation)
         - Sortie : matrice patients × sites, prête pour sklearn.
-          Format Parquet (zstd, float32) recommandé pour les grandes cohortes
-          (>>10× plus rapide et plus compact que TSV).
+          Format Parquet (zstd, float32) >>10× plus rapide et plus compact que TSV.
 
   2. run_pca
         clustering_matrix.parquet → pca_coords.tsv + pca_variance.tsv
@@ -44,13 +41,6 @@ Sous-commandes :
 Métadonnées cliniques (optionnel) :
     --metadata : TSV avec colonne "sample" + colonnes de groupes/phénotypes
     Quand fourni, les plots colorent par groupe au lieu de par cluster.
-
-Format de la matrice (Parquet) :
-    Stockée en orientation sites × patients (millions de lignes, ~40-100
-    colonnes) pour optimiser le format colonnaire Parquet. Transposée en
-    mémoire en patients × sites (attendu par sklearn) à chaque chargement.
-    Les valeurs sont en float32 (7 décimales significatives — largement
-    suffisant pour des beta values stockées à 4 décimales).
 """
 
 import os
@@ -67,12 +57,14 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from matplotlib.colors import Normalize
 from scipy.stats import rankdata
+from scipy.cluster.hierarchy import linkage, dendrogram, fcluster
+from scipy.spatial.distance import squareform
 from sklearn.preprocessing import StandardScaler, RobustScaler
 from sklearn.decomposition import PCA
 from sklearn.cluster import KMeans
 from sklearn.mixture import GaussianMixture 
 from sklearn.impute import KNNImputer
-from sklearn.metrics import silhouette_score
+from sklearn.metrics import silhouette_score as _sil
 import umap
 
 try:
@@ -113,26 +105,17 @@ def parse_args():
     pr.add_argument("--top-n", type=int, default=None,
                     help="Nombre de sites les plus variables à conserver (défaut : tous). "
                          "La variance est calculée après imputation, donc déconseillé pour les cohortes modérées.")
-    pr.add_argument("--min-completeness", type=float, default=0.7,
-                    help="Fraction minimale de patients non-NaN requise par site pour être conservé (défaut : 0.7). Filtre "
-                         "appliqué après le filtre semi-strict amont (déjà présent dans methylation_cohort.tsv), spécifiquement "
-                         "pour limiter le recours à l'imputation en amont du clustering. ATTENTION : avec un grand nombre de "
-                         "patients, cet effet de seuil peut être très abrupt (cf. --completeness-histogram pour diagnostiquer "
-                         "avant de fixer ce seuil).")
-    pr.add_argument("--completeness-histogram", default=None,
-                    help="Chemin de sortie pour un histogramme (TSV, comptage par tranche de 5%%) de la complétude par site, "
-                         "calculé avant filtrage. Recommandé sur les grandes cohortes pour choisir --min-completeness de façon "
-                         "data-driven plutôt qu'arbitraire (ex. repérer une distribution bimodale en adaptive sampling et placer "
-                         "le seuil dans la vallée entre les deux modes).")
+    pr.add_argument("--min-completeness", type=float, default=1,
+                    help="Fraction minimale de patients non-NaN requise par site pour être conservé (défaut : 1). Filtre "
+                         "appliqué pour limiter le recours à l'imputation en amont du clustering.")
     pr.add_argument("--imputation-method", default="pca",
                     choices=["median", "knn", "pca", "random", "no_impute"],
                     help="Méthode d'imputation des NaN résiduels (défaut : pca)."
-                         "'median' : médiane du site sur les patients "
-                         "couverts (legacy — traite chaque site indépendamment et écrase la covariance inter-sites)."
+                         "'median' : médiane du site sur les patients couverts (écrase la covariance inter-sites)."
                          "'knn' : k plus proches voisins entre patients (similarité de profil global)."
-                         "'pca' : PCA itérative / EM (préserve la structure de covariance inter-sites — recommandé pour la suite PCA/k-means)."
+                         "'pca' : PCA itérative / EM (préserve la structure de covariance inter-sites)."
                          "'random' : imputation aléatoire (utile pour tester la robustesse du clustering)."
-                         "'no_impute' : pas d'imputation, conserve les NaN (utile pour run_available_case).")
+                         "'no_impute' : pas d'imputation, conserve les NaN.")
     pr.add_argument("--knn-neighbors", type=int, default=5,
                     help="Nombre de voisins pour --imputation-method knn (défaut : 5)")
     pr.add_argument("--pca-n-components", type=int, default=10,
@@ -140,7 +123,7 @@ def parse_args():
     pr.add_argument("--pca-max-iter", type=int, default=50,
                     help="Itérations maximales pour la convergence de l'imputation PCA (défaut : 50)")
     pr.add_argument("--pca-tol", type=float, default=1e-4,
-                    help="Seuil de convergence — variation relative de la norme de Frobenius entre deux itérations (défaut : 1e-4)")
+                    help="Seuil de convergence (défaut : 1e-4)")
     pr.add_argument("--output-format", default="parquet",
                     choices=["parquet", "tsv"],
                     help="Format de la matrice de sortie (défaut : parquet). ")
@@ -225,21 +208,15 @@ def parse_args():
     gmm.add_argument("--covariance-type", default="diag",
                     choices=["full", "tied", "diag", "spherical"],
                     help="Type de covariance du GMM. "
-                         "'full' : matrice p×p pleine par composante — nécessite n_patients_par_cluster > p pour être "
-                         "non-singulière ; avec p (sites) >> n (patients), la covariance est structurellement singulière "
-                         "quel que soit reg_covar (ce n'est pas une question de réglage numérique). "
-                         "'diag' : variances indépendantes par site, k*p paramètres, reste "
-                         "identifiable même pour p grand — recommandé si l'entrée est la matrice de sites complète. "
-                         "'spherical' : variance isotrope par composante, le plus contraint, robuste aux petits effectifs par "
-                         "cluster (utile si singletons attendus). "
+                         "'full' : matrice p×p pleine par composante avec p (sites) >> n (patients), "
+                         "la covariance est structurellement singulière quel que soit reg_covar. "
+                         "'diag' : variances indépendantes par site, k*p paramètres "
+                         "'spherical' : variance isotrope par composante, robuste aux petits effectifs par cluster. "
                          "'tied' : covariance partagée entre composantes. "
                          "'full'/'tied' ne sont défendables que sur un espace réduit (ex. coordonnées PCA/PCoA, p<n).")
     gmm.add_argument("--reg-covar", type=float, default=1e-6,
                     help="Terme additif sur la diagonale de covariance pour la stabilité "
-                         "numérique (défaut sklearn : 1e-6). X étant toujours standardisé "
-                         "par _get_scaler avant le fit (échelle ~1), le défaut est "
-                         "généralement adapté ; à augmenter seulement en cas de warning "
-                         "de dégénérescence explicite malgré covariance_type approprié.")
+                         "numérique (défaut sklearn : 1e-6).")
     gmm.add_argument("--use-robust-scaler", action="store_true",
                        help="Utiliser RobustScaler au lieu de StandardScaler.")
     gmm.add_argument("--label-bool", default=True,
@@ -275,11 +252,9 @@ def parse_args():
     ac.add_argument("--k-final", type=int, default=None,
                     help="K final pour k-medoids. Si omis, sélection automatique par silhouette maximale.")
     ac.add_argument("--n-cut", type=int, default=None,
-                    help="Couper le dendrogramme hiérarchique en N clusters. "
-                         "Si omis, le dendrogramme complet est produit sans partition forcée.")
+                    help="Couper le dendrogramme hiérarchique en N clusters. ")
     ac.add_argument("--min-coobs", type=int, default=1000,
                     help="Nombre minimal de sites co-observés requis entre deux patients pour que leur distance soit considérée fiable. "
-                         "Cette option est pertinente uniquement si la matrice contient des NaN. "
                          "Si la matrice est complète, ce paramètre est ignoré.")
     ac.add_argument("--pca-coords", default=None,
                     help="pca_coords.tsv (optionnel) : projeter les clusters sur le scatter PCA pour comparaison visuelle")
@@ -322,8 +297,6 @@ def _get_scaler(use_robust: bool):
 
     StandardScaler : mean/std. Sensible aux outliers.
     RobustScaler   : median/IQR. Robuste aux outliers et aux sites extremes.
-
-    Recommande : RobustScaler si --use-robust-scaler ou si tous les sites (~2M).
     """
     if use_robust:
         log.info("Utilisation de RobustScaler (median/IQR, robuste aux outliers, epsilon=1e-8)")
@@ -336,7 +309,6 @@ def _get_scaler(use_robust: bool):
 def _detect_samples(columns: list) -> list:
     """
     Détecte les noms de patients depuis les colonnes beta_<sample>.
-    Même logique que compute_stats.py pour être cohérent.
     """
     samples = []
     for c in columns:
@@ -356,23 +328,6 @@ def _detect_samples(columns: list) -> list:
 def _write_matrix(M: pd.DataFrame, outdir: str, tag: str, fmt: str) -> str:
     """
     Écrit la matrice de clustering patients × sites sur disque.
-
-    Orientation de stockage :
-        TSV     → patients × sites (lignes = patients, colonnes = site_ids).
-                  Pratique pour inspection manuelle, mais lent sur >>100k sites.
-        Parquet → transposée en sites × patients (lignes = site_ids, colonnes
-                  = patients + colonne index 'site_id').
-                  Raison : Parquet est un format colonnaire. Avec millions de
-                  lignes et ~40-100 colonnes, chaque colonne-patient est stockée
-                  en un bloc contigu compressé → lecture très rapide même sur
-                  de très grandes matrices. L'orientation inverse (patients en
-                  lignes, millions de colonnes) produirait un fichier Parquet
-                  dégénéré avec autant de métadonnées que de données utiles, et
-                  annulerait tout le bénéfice du format colonnaire.
-                  Précision float32 : les beta values ont 4 décimales utiles
-                  (format "%.4f" dans le TSV legacy) ; float32 offre 7 décimales
-                  significatives — sans perte d'information pertinente, mais avec
-                  une réduction de 50% de la taille mémoire et disque vs float64.
     """
 
     if fmt == "parquet":
@@ -411,9 +366,6 @@ def _load_matrix(path: str) -> pd.DataFrame:
     Parquet : lu via Polars (scan_parquet → collect), transposé en mémoire.
     TSV     : fallback pd.read_csv pour compatibilité ascendante avec les
               fichiers produits par les versions antérieures du script.
-
-    Les NaN sont autorisés ici : les sous-commandes PCA/UMAP/k-means les
-    traitent ensuite en retirant les sites qui en contiennent au moins un.
     """
     if path.endswith(".parquet"):
         # Polars lit le fichier colonnaire en parallèle (multithreaded)
@@ -468,11 +420,6 @@ def _load_matrix_with_nan(path: str) -> tuple[np.ndarray, list[str]]:
     """
     Charge une matrice produite par prepare --no-impute (NaN autorisés)
     sous forme de tableau NumPy patients × sites.
-
-    Contrairement à la version DataFrame, cette variante évite la création
-    d'un DataFrame pandas intermédiaire et la transposition coûteuse sur un
-    objet pandas, ce qui réduit fortement le temps de chargement sur les
-    grandes matrices parquet.
     """
     if path.endswith(".parquet"):
         pl_df   = pl.read_parquet(path)
@@ -527,12 +474,6 @@ def _pairwise_euclidean(M: np.ndarray, min_coobs: int) -> np.ndarray:
 def _rank_transform_available(M: np.ndarray) -> np.ndarray:
     """
     Transforme chaque ligne (patient) en rangs, en ignorant les NaN.
-
-    Nécessaire pour Spearman available-case : rankdata ne gère pas les NaN
-    nativement (il les inclurait dans le rang, faussant toute la ligne).
-    Rangs "average" en cas d'ex-aequo — cohérent avec des beta values
-    discrétisées par la profondeur de lecture (deux sites peuvent partager
-    exactement le même beta chez un patient, ex. 3/10 reads).
     """
     n, p = M.shape
     R = np.full((n, p), np.nan, dtype=np.float64)
@@ -572,20 +513,11 @@ def _log_coobs_diagnostic(n_co: np.ndarray, min_coobs: int, n: int, metric_label
 
 def _correlation_pairwise_available(M: np.ndarray, metric_label: str = "pearson") -> tuple:
     """
-    Distance 1 - corrélation de Pearson, calculée uniquement sur les sites
-    co-observés entre chaque paire de patients (available-case).
+    Distance 1 - corrélation de Pearson, calculée sur les sites
+    co-observés entre chaque paire de patients.
 
     À utiliser directement pour Pearson, ou sur une matrice pré-transformée
     en rangs (_rank_transform_available) pour Spearman.
-
-    Contrairement à la distance euclidienne, le centrage/normalisation
-    d'une corrélation est spécifique à l'ensemble des sites co-observés de
-    CHAQUE paire (i,j) — aucune factorisation matricielle exacte commune à
-    toutes les paires n'existe (contrairement à d²(i,j) = Σβ²_i + Σβ²_j -
-    2Σβ_iβ_j qui se décompose en produits matriciels indépendants de la
-    paire). Calcul donc effectué paire par paire (n choose 2 paires), mais
-    chaque paire est vectorisée sur l'axe des sites via NumPy : avec
-    n~78 patients, 3003 paires, coût négligeable même pour p élevé.
 
     Retourne (D, n_co).
     """
@@ -683,20 +615,7 @@ def _color_vector(samples, meta, color_by, labels=None):
 def _scatter_plot(coords, samples, colors, patches, xlabel, ylabel, title, out_path, label_bool,
                   color_mode="categorical", cmap_norm=None, colorbar_label=None):
     """
-    Repère orthonormé (set_aspect('equal')) : PC1/PC2 (et UMAP1/UMAP2) sont
-    deux axes orthogonaux exprimés dans la même unité — un aspect ratio
-    libre déforme visuellement les distances et les angles réels entre
-    patients, et fausse la lecture de la dispersion (PC1 portant presque
-    toujours plus de variance que PC2, l'effet de déformation est quasi
-    systématique sans cette correction). Pour UMAP, l'orthonormalité évite
-    une distorsion supplémentaire, mais ne rend pas les distances UMAP
-    globalement interprétables (l'algorithme ne préserve que la structure
-    de voisinage local).
-
-    Labels : si adjustText est installé, les noms de patients sont répartis
-    automatiquement pour minimiser les chevauchements (répulsion itérative),
-    avec des flèches reliant le label à son point quand il a été déplacé.
-    Sinon, repli sur un simple décalage fixe (comportement historique).
+    Génère un scatter plot (PCA ou UMAP) avec coloration par cluster ou par métadonnées.
     """
     fig, ax = plt.subplots(figsize=(9, 7))
     scatter = ax.scatter(coords[:, 0], coords[:, 1], c=colors, s=90,
@@ -743,23 +662,12 @@ def _scatter_plot(coords, samples, colors, patches, xlabel, ylabel, title, out_p
 # ================== IMPUTATION (patients × sites) =========
 #
 # Les trois fonctions ci-dessous opèrent toutes sur une matrice M orientée
-# patients (lignes) × sites (colonnes) — la même orientation que celle
-# utilisée en aval par PCA/k-means (patients = observations, sites =
-# features). Elles retournent une matrice complète (sans NaN), bornée à
-# [0, 1] car beta est une proportion.
+# patients (lignes) × sites (colonnes). Elles retournent une matrice
+# complète (sans NaN), bornée à [0, 1] car beta est une proportion.
 
 def _impute_median(M: pd.DataFrame) -> pd.DataFrame:
     """
     Imputation par médiane du site (sur les patients couverts).
-
-    Conservée pour compatibilité et comparaison, mais déconseillée comme
-    méthode principale pour le clustering : chaque site est traité
-    indépendamment, ce qui écrase la covariance inter-sites. Combinée à une
-    sélection de sites par variance, ce traitement biaise la sélection vers
-    les sites où l'imputation introduit le plus de bruit relatif plutôt que
-    vers les sites biologiquement les plus informatifs — c'est très
-    probablement la cause du scree plot plat (PC1 ~3.5%) et des clusters
-    singletons observés sur la cohorte à 16 patients.
     """
     site_medians = M.median(axis=0, skipna=True)
     return M.fillna(site_medians)
@@ -768,26 +676,6 @@ def _impute_median(M: pd.DataFrame) -> pd.DataFrame:
 def _impute_knn(M: pd.DataFrame, n_neighbors: int) -> pd.DataFrame:
     """
     Imputation par k plus proches voisins entre patients.
-
-    Pour chaque valeur manquante (patient p, site s), la distance euclidienne
-    entre p et chaque autre patient est calculée sur les sites co-observés
-    uniquement (cf. Troyanskaya et al. 2001, méthode standard pour les
-    matrices d'expression à trous), puis la valeur manquante est imputée par
-    la moyenne pondérée par distance des n_neighbors patients les plus
-    proches au même site.
-
-    Contrairement à la médiane par site, cette méthode exploite la
-    similarité du profil épigénétique global du patient plutôt qu'une
-    statistique marginale du site qui ignore toute structure inter-patients.
-    Pertinent quand on suppose que les patients partagent une structure de
-    sous-groupes (l'hypothèse même du clustering) : un patient est imputé en
-    se rapprochant des patients dont il est globalement le plus proche.
-
-    Limite : suppose implicitement que la similarité globale (calculée sur
-    tous les sites retenus) est informative même avant d'avoir identifié les
-    sous-groupes — risque de lissage circulaire si n_neighbors est trop
-    petit par rapport à la taille de cohorte. Pour n petit (<20 patients),
-    préférer --imputation-method pca.
     """
     imputer = KNNImputer(n_neighbors=n_neighbors, weights="distance")
     X = imputer.fit_transform(M.to_numpy(dtype=float))
@@ -802,44 +690,18 @@ def _impute_pca_em(
     tol: float = 1e-4,
 ) -> pd.DataFrame:
     """
-    Imputation par PCA itérative (algorithme EM / iterativeSVD), équivalent
-    à missMDA::imputePCA en R (Josse & Husson, 2012, J. SFdS).
+    Imputation par PCA itérative (EM) sur les patients, en préservant la covariance inter-sites.
 
-    Principe : contrairement à l'imputation par médiane, qui traite chaque
-    site indépendamment, cette méthode reconstruit les valeurs manquantes en
+    Principe : cette méthode reconstruit les valeurs manquantes en
     exploitant la structure de corrélation entre patients capturée par les
     n_components premières composantes principales. Elle préserve donc la
-    covariance inter-sites au lieu de l'écraser, ce qui la rend cohérente
-    avec l'usage en aval (la matrice imputée sert justement à une PCA).
-
-    Algorithme :
-      1. Initialisation : NaN remplacés par la moyenne du site (sur patients
-         couverts).
-      2. PCA à n_components sur la matrice courante.
-      3. Reconstruction X_hat = scores @ loadings + moyenne.
-      4. Seules les positions originellement manquantes sont remplacées par
-         X_hat ; les valeurs observées restent inchangées à chaque itération.
-      5. Répéter 2-4 jusqu'à convergence (variation relative de la norme de
-         Frobenius < tol) ou max_iter atteint.
-
-    C'est la méthode recommandée par défaut : elle est cohérente avec
-    l'observation que pour une cohorte de taille modérée (~40 patients), la
-    matrice complète (sans présélection de sites par variance) est
-    biologiquement préférable, et elle évite le biais d'écrasement de
-    covariance introduit par l'imputation médiane.
-    
-    Optimisation NumPy : initialisation et itérations effectuées directement
-    sur les arrays NumPy (pas d'allers-retours DataFrame → NumPy) pour une
-    vectorisation complète et une performance ~2-3× supérieure sur les grandes
-    matrices (>100k sites).
+    covariance inter-sites au lieu de l'écraser.
     """
     mask = M.isna()
     n_missing = int(mask.to_numpy().sum())
     if n_missing == 0:
         return M
 
-    # Conversion une seule fois en NumPy ; initialisation par np.nanmean (vectorisé)
-    # au lieu de M.mean().fillna() (qui itère colonne-par-colonne chez pandas).
     X = M.to_numpy(dtype=np.float64, copy=True)
     col_means = np.nanmean(X, axis=0)
     nan_rows, nan_cols = np.where(np.isnan(X))
@@ -921,69 +783,10 @@ def _site_completeness(M: pd.DataFrame) -> pd.Series:
     return M.notna().sum(axis=0) / M.shape[0]
 
 
-def _log_completeness_distribution(frac_observed: pd.Series):
-    """
-    Logue les quantiles de la distribution de complétude par site, avant
-    tout filtrage. Indispensable avant de choisir min_completeness :
-    avec une grande cohorte (N patients élevé), le nombre de patients
-    couverts par site suit approximativement une loi binomiale qui se
-    concentre fortement autour de sa moyenne (écart-type ~ sqrt(N*q*(1-q))).
-    Un effet de seuil très abrupt est donc normal — un déplacement de
-    quelques points du seuil peut faire passer le nombre de sites retenus
-    de la quasi-totalité à presque rien, sans zone de transition douce.
-    Inspecter ces quantiles avant de fixer le seuil évite de choisir une
-    valeur arbitraire qui tombe dans la zone de chute brutale.
-    """
-    qs = [0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0]
-    quantiles = frac_observed.quantile(qs)
-    summary = ", ".join(f"p{int(q*100)}={v:.3f}" for q, v in quantiles.items())
-    log.info("  distribution de complétude par site (avant filtre) : %s", summary)
-
-
-def _write_completeness_histogram(frac_observed: pd.Series, path: str, n_bins: int = 20):
-    """
-    Écrit un histogramme (comptage par tranche de complétude) plutôt que la
-    liste complète par site, pour rester léger même avec des millions de
-    sites. À tracer (barplot bin_low/bin_high vs n_sites) pour repérer
-    visuellement si la distribution est bimodale (ex. adaptive sampling :
-    un pic hors-cible proche de 0 et un pic sur-cible proche de 1) — dans ce
-    cas, le seuil de complétude doit être placé dans la vallée entre les
-    deux modes, pas à une valeur ronde arbitraire comme 0.5 ou 0.7.
-    """
-    counts, edges = np.histogram(frac_observed.to_numpy(), bins=n_bins, range=(0.0, 1.0))
-    hist_df = pd.DataFrame({
-        "bin_low":  edges[:-1],
-        "bin_high": edges[1:],
-        "n_sites":  counts,
-    })
-    parent = os.path.dirname(path)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    hist_df.to_csv(path, sep="\t", index=False)
-    log.info("  histogramme de complétude (%d tranches) écrit → %s", n_bins, path)
-
-
 def _completeness_filter(M: pd.DataFrame, frac_observed: pd.Series, min_completeness: float) -> pd.DataFrame:
     """
     Filtre les sites (colonnes) dont la fraction de patients non-NaN est
     inférieure à min_completeness.
-
-    Justification statistique : ce filtre est distinct du filtre semi-strict
-    déjà appliqué en amont (au niveau du pipeline methylation_cohort.tsv,
-    qui garantit ≥ ceil(min_cov_frac × N) patients couverts par site). Ici,
-    l'objectif est différent : limiter spécifiquement la part de valeurs
-    imputées dans la matrice de clustering, quelle que soit la méthode
-    d'imputation choisie. Plus un site a de NaN, plus son imputation est une
-    extrapolation plutôt qu'une estimation — un site imputé à 90% n'apporte
-    quasiment aucune information patient-spécifique réelle, qu'on le sache
-    ou non au moment de l'interpréter.
-
-    ATTENTION : avec un grand nombre de patients, ce filtre a un effet de
-    seuil très abrupt (cf. _log_completeness_distribution) — toujours
-    inspecter la distribution avant de fixer min_completeness, plutôt que
-    d'utiliser la valeur par défaut sans vérification sur des cohortes de
-    grande taille ou des données à couverture très hétérogène (ex. adaptive
-    sampling).
     """
     keep = frac_observed >= min_completeness
     n_dropped = int((~keep).sum())
@@ -1002,14 +805,6 @@ def cmd_prepare(args):
     Lit methylation_cohort.tsv, filtre sur mod_code, filtre les sites par
     complétude, impute les NaN résiduels, sélectionne optionnellement les
     top N sites les plus variables, et produit une matrice patients × sites.
-
-    Pas d'agrégation des brins : le pipeline a déjà conservé un seul brin
-    par position (le plus couvert) dans parse_sample.
-
-    Imputation : avec le filtre semi-strict amont, beta=NaN signifie que le
-    patient avait N_valid < min_cov sur ce site. --imputation-method
-    contrôle la méthode utilisée pour ces NaN résiduels (median / knn / pca,
-    cf. docstrings des fonctions _impute_*).
     """
     os.makedirs(args.outdir, exist_ok=True)
     log.info("prepare : chargement de %s…", args.cohort_tsv)
@@ -1078,11 +873,6 @@ def cmd_prepare(args):
             sys.exit(1)
 
     # ── Passage en orientation patients × sites ──────────
-    # Toutes les étapes suivantes (filtre de complétude, imputation,
-    # sélection de variance) opèrent dans cette orientation : cohérente avec
-    # l'espace utilisé en aval par PCA/k-means (patients = observations,
-    # sites = features), et nécessaire pour que kNN/PCA-EM exploitent la
-    # similarité entre patients plutôt qu'une statistique par site isolé.
     M = beta_mat.T
     M.columns = df["site_id"].values
     M.index = samples
@@ -1098,9 +888,6 @@ def cmd_prepare(args):
 
     # ── Diagnostic + filtre de complétude ─────────────────
     frac_observed = _site_completeness(M)
-    _log_completeness_distribution(frac_observed)
-    if args.completeness_histogram:
-        _write_completeness_histogram(frac_observed, args.completeness_histogram, n_bins=20)
 
     M = _completeness_filter(M, frac_observed, args.min_completeness)
     if M.shape[1] == 0:
@@ -1188,21 +975,6 @@ def cmd_prepare(args):
             top_n, var.nlargest(top_n).median(), var.nlargest(top_n).min(), var.nlargest(top_n).max()
         )
 
-    # Diagnostic à faire avant de binariser :
-    flat = M.values.flatten()
-    flat = flat[~np.isnan(flat)]
-
-    fig, ax = plt.subplots(figsize=(7, 4))
-    ax.hist(flat, bins=100)
-    ax.set_xlabel("Beta value")
-    ax.set_ylabel("Nombre de sites")
-    ax.set_title("Distribution globale des beta — décision de binarisation", fontweight="bold")
-    fig.tight_layout()
-    fig.savefig(os.path.join(args.outdir, "distribution_beta.png"),
-                dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    log.info("  → distribution_beta.png")
-
     # ── Binarisation ──────────────────────────
     if args.seuil =="True":
         log.info("Binarisation de la matrice : beta >= 0.5 → 1, beta < 0.5 → 0")
@@ -1222,18 +994,6 @@ def _scatter_grid_pca(coords, evr, samples, colors, patches,
     Grille 2×2 (PC1/2, PC1/3, PC2/3, scree) — ou grille 1×3 sans scree
     plot si color_by == "risk" ou == "age"
 
-    Le scree plot n'a de sens que pour guider le choix du nombre de
-    composantes à retenir lors d'une exploration structurale
-    (clustering, groupes cliniques). Quand la coloration encode un
-    score de risque continu, l'objectif de la figure change : on
-    cherche à visualiser un gradient dans l'espace PCA, pas à motiver
-    un choix de dimensionnalité. Le scree plot devient alors non
-    pertinent et est retiré — décision pilotée directement par
-    l'argument --color-by transmis par l'utilisateur, indépendamment
-    de la présence effective de valeurs de risque valides dans les
-    métadonnées (pour rester cohérent même si toutes les valeurs de
-    risk sont NaN).
-
     Layout (show_scree=True) :
         ┌──────────────┬──────────────┐
         │  PC1 vs PC2  │  PC1 vs PC3  │
@@ -1246,10 +1006,7 @@ def _scatter_grid_pca(coords, evr, samples, colors, patches,
         │  PC1 vs PC2  │  PC1 vs PC3  │  PC2 vs PC3  │
         └──────────────┴──────────────┴──────────────┘
 
-    Chaque scatter est en repère orthonormé (set_aspect='equal') :
-    PC1, PC2, PC3 sont orthogonaux par construction et exprimés dans
-    la même unité (variance standardisée) — un aspect ratio libre
-    déformerait les distances et angles réels entre patients.
+    Chaque scatter est en repère orthonormé.
     """
     n_comp_avail = coords.shape[1]
     pairs = [(0, 1), (0, 2), (1, 2)]   # indices des paires PC à afficher
@@ -1543,10 +1300,7 @@ def _elbow_k(inertias: list, k_range: range) -> int:
 def _write_cluster_membership(df_labels: pd.DataFrame, outdir: str, tag: str) -> str:
     """
     Écrit un fichier "un cluster par ligne" regroupant les noms de patients,
-    en complément de kmeans_labels.tsv (une ligne par patient). Pensé pour
-    être lu directement plutôt que de déchiffrer des labels superposés sur
-    un scatter plot — surtout utile dès que la cohorte dépasse une dizaine
-    de patients ou que plusieurs noms tombent au même endroit visuellement.
+    en complément de kmeans_labels.tsv (une ligne par patient).
     """
     grouped = (
         df_labels.groupby("cluster")["sample"]
@@ -1588,7 +1342,7 @@ def cmd_run_kmeans(args):
                         n_init=10, max_iter=300)
         labels = km.fit_predict(X)
         inertias.append(km.inertia_)
-        sil = silhouette_score(X, labels) if k > 1 else np.nan
+        sil = _sil(X, labels) if k > 1 else np.nan
         silhouettes.append(sil)
         log.info("  k=%d : inertie=%.1f  silhouette=%.4f", k, km.inertia_, sil)
 
@@ -1678,22 +1432,6 @@ def cmd_run_kmeans(args):
 def cmd_run_gmm(args):
     """
     Fit d'un Gaussian Mixture Model (GMM) sur la matrice patients × sites.
-    Contrairement à k-means, GMM ne contraint pas les clusters à être
-    sphériques (selon covariance_type) et fournit une affectation
-    probabiliste (soft clustering) ; seule l'affectation MAP (hard label)
-    est conservée ici pour rester comparable aux autres sous-commandes.
-
-    AVERTISSEMENT DIMENSIONNALITÉ : le nombre de features p (sites retenus
-    après filtre NaN) est presque toujours très supérieur au nombre de
-    patients n. Pour covariance_type='full'/'tied', la matrice de
-    covariance par composante est alors structurellement singulière
-    (rang ≤ n_k - 1 pour n_k patients dans le cluster k, alors qu'une
-    matrice p×p pleine de rang plein nécessite n_k ≥ p+1) : reg_covar
-    masque le symptôme numérique mais ne restaure pas l'identifiabilité
-    statistique. 'diag' ou 'spherical' restent identifiables même pour
-    p >> n et sont recommandés ici ; 'full'/'tied' ne sont statistiquement
-    défendables que sur un espace de features réduit (ex. axes PCA/PCoA,
-    p < n).
     """
     log.info("run_gmm : chargement de la matrice…")
     matrix  = _load_matrix(args.matrix)
@@ -1762,8 +1500,7 @@ def cmd_run_gmm(args):
     )
     labels = gmm_final.fit_predict(X)
 
-    # Diagnostic clusters singletons — pertinent pour cette cohorte à
-    # petits effectifs, cf. constat déjà fait sur d'autres analyses GMM.
+    # Diagnostic clusters singletons
     counts = pd.Series(labels).value_counts().sort_index()
     n_singletons = int((counts == 1).sum())
     if n_singletons > 0:
@@ -1853,14 +1590,10 @@ def cmd_run_gmm(args):
 def _kmedoids(D: np.ndarray, k: int, n_init: int = 20,
               random_state: int = 42) -> tuple:
     """
-    K-medoids (algorithme PAM simplifié) sur une matrice de dissimilarité.
+    K-medoids sur une matrice de dissimilarité.
 
-    Contrairement à k-means dont les centroïdes sont des barycentres
-    (points virtuels calculés comme moyennes — ce qui exige des valeurs
-    complètes), les medoids sont des patients réels de la cohorte. Cela
-    rend l'algorithme compatible avec des distances précalculées sur données
-    incomplètes : aucune valeur n'est jamais inventée ou reconstituée à
-    aucune étape.
+    Contrairement à k-means dont les centroïdes sont des barycentres,
+    les medoids sont des patients réels de la cohorte.
 
     Algorithme :
       1. Initialisation aléatoire de k medoids parmi les patients.
@@ -1879,10 +1612,6 @@ def _kmedoids(D: np.ndarray, k: int, n_init: int = 20,
     best_cost    = np.inf
     best_medoids = None
 
-    # Remplacer les NaN dans D par une grande valeur finie pour les
-    # comparaisons argmin (les paires sans co-observation ne seront jamais
-    # choisies comme plus proches voisins, mais la structure du clustering
-    # peut quand même les affecter à un cluster par défaut).
     D_safe = np.where(np.isnan(D), np.nanmax(D) * 10 + 1, D)
     np.fill_diagonal(D_safe, 0.0)
 
@@ -1923,8 +1652,7 @@ def cmd_run_pairwise(args):
       5. Fichiers de composition des clusters (hiérarchique + k-medoids)
       6. Scatter plots PCA/UMAP si coordonnées fournies
     """
-    from scipy.cluster.hierarchy import linkage, dendrogram, fcluster
-    from scipy.spatial.distance import squareform
+
 
     log.info("run_pairwise : chargement de %s…", args.matrix)
     matrix, samples = _load_matrix_with_nan(args.matrix)
@@ -1969,10 +1697,6 @@ def cmd_run_pairwise(args):
         color_threshold=0.7 * max(Z[:, 2]),
     )
 
-    # Ajuster l'axe Y pour éviter un dendrogramme écrasé lorsque la plus
-    # petite dissimilarité de fusion est élevée. On place la limite
-    # inférieure proche de la plus petite hauteur de fusion moins une marge
-    # relative, sans descendre sous 0.
     try:
         if Z.shape[0] > 0:
             h_min = float(Z[:, 2].min())
@@ -1983,7 +1707,6 @@ def cmd_run_pairwise(args):
                 ax.set_ylim(bottom=y_bottom)
                 log.info("  dendrogram y-axis ajustée : bottom=%.3f (min merge=%.3f)", y_bottom, h_min)
     except Exception:
-        # Ne pas échouer le pipeline pour un problème d'affichage
         log.debug("  impossible d'ajuster l'axe Y du dendrogramme", exc_info=True)
 
     ax.set_title(
@@ -2025,8 +1748,6 @@ def cmd_run_pairwise(args):
     log.info("  k-medoids pour k=%d à k=%d…", k_min, k_max)
 
     # Silhouette sur la matrice D_fill (distances précalculées)
-    from sklearn.metrics import silhouette_score as _sil
-
     results = []
     for k in k_range:
         labels, cost, medoids = _kmedoids(

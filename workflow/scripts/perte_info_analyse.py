@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-coverage_loss_analysis.py
+perte_info_analyse.py
 
 Analyse de la perte d'information (couverture inter-patients) sur la matrice
-cohorte de méthylation (sites x patients), projet STONG.
+cohorte de méthylation (sites x patients), projet STING.
 
 Structure attendue de matrice_cohorte.tsv (séparateur tabulation) :
   - colonnes méta fixes : site_id, chrom, start, mod_code, origin,

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-methylation_distribution.py — Diagnostic de la distribution de méthylation
+distribution_meth.py — Diagnostic de la distribution de méthylation
 ===========================================================================
 
 Prend en entrée methylation_cohort.tsv (une ligne par site CpG, colonnes

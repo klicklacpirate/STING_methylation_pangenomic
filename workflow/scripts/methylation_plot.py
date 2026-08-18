@@ -163,11 +163,6 @@ def plot_heatmap_variable_sites(df: pd.DataFrame, beta_cols: list, barcodes: lis
       de méthylation → regroupe les CpGs co-régulés (même pattern inter-patients).
     - Axe patients (colonnes) : clustering Ward sur distance euclidienne entre
       patients → révèle les sous-groupes épigénétiques (potentiels sous-types cliniques).
-
-    Imputation préalable par médiane de site : nécessaire pour que pdist/linkage
-    ne produisent pas de NaN dans la matrice de distance. L'imputation par médiane
-    est conservatrice (pas d'information artificielle introduite) et cohérente avec
-    l'usage dans clustering.py.
     """
     variance = compute_variance(df, beta_cols)
 
@@ -331,13 +326,6 @@ def build_pivot_pairs(n_patients: int, n_groups: int = 3, per_group: int = 3) ->
       - Les patients restants sont distribués équitablement comme cibles.
       - Si le nombre de patients est insuffisant pour remplir tous les groupes,
         on recycle les cibles (avec avertissement) plutôt que de supprimer des plots.
-
-    Exemple pour 10 patients, 3 groupes de 3 :
-      pivots  = [0, 1, 2]
-      cibles  = [3, 4, 5, 6, 7, 8, 9]
-      groupe0 = [(0,3),(0,4),(0,5)]
-      groupe1 = [(1,6),(1,7),(1,8)]
-      groupe2 = [(2,9),(2,3),(2,4)]  ← recyclage si nécessaire
 
     Retourne une liste plate de tuples (i, j) prête pour enumerate().
     """
